@@ -1,67 +1,167 @@
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+import os
+import tempfile
+import shutil
 from pathlib import Path
-import uuid
+from typing import List
+
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+
+from face2voice.inference.inference import Inference
+
 
 app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # в проде лучше ограничить доменами фронтенда
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-BASE_DIR = Path(__file__).resolve().parent
-IMAGES_DIR = BASE_DIR / "storage" / "images"
-TEXTS_DIR = BASE_DIR / "storage" / "texts"
-
-IMAGES_DIR.mkdir(parents=True, exist_ok=True)
-TEXTS_DIR.mkdir(parents=True, exist_ok=True)
-
-MAX_TEXT_LEN = 5000
-MAX_FILE_SIZE = 25 * 1024 * 1024  # 25 МБ
-ALLOWED_CONTENT_TYPES = {"image/jpeg", "image/png"}
+inference: Inference | None = None
 
 
-@app.post("/submit")
-async def submit(
+def init_inference() -> Inference:
+    """
+    Инициализация Inference с путями, аналогичными примеру из inference.py.
+    Путь считается относительно корня репозитория face2voice.
+    """
+    base_dir = Path(__file__).resolve().parent.parent  # корень репо face2voice
+    ckpt_root = base_dir / "face2voice" / "checkpoints"
+
+    face2voice_ckpt = ckpt_root / "f2v" / "face2voice_ckpt.pth"
+    face_encoder_ckpt = ckpt_root / "face_encoder" / "facenet_checkpoint.pth"
+    shape_pred_path = ckpt_root / "dlib" / "shape_predictor_68_face_landmarks.dat"
+    tone_conv_ckpt = ckpt_root / "tone_conv" / "checkpoint.pth"
+    tone_conv_conf = ckpt_root / "tone_conv" / "config.json"
+    tts_ckpt = ckpt_root / "xtts"
+    tts_conf = ckpt_root / "xtts" / "config.json"
+    speakers_path = ckpt_root / "xtts" / "speakers_xtts.pth"
+    speaker = "Filip Traverse"
+
+    for p in [
+        face2voice_ckpt,
+        face_encoder_ckpt,
+        shape_pred_path,
+        tone_conv_ckpt,
+        tone_conv_conf,
+        tts_ckpt,
+        tts_conf,
+        speakers_path,
+    ]:
+        if not p.exists():
+            raise RuntimeError(f"Не найден файл/директория модели: {p}")
+
+    infer = Inference(
+        face2voice_ckpt=str(face2voice_ckpt),
+        face_encoder_ckpt=str(face_encoder_ckpt),
+        shape_pred_path=str(shape_pred_path),
+        tone_conv_ckpt=str(tone_conv_ckpt),
+        tone_conv_conf=str(tone_conv_conf),
+        tts_ckpt=str(tts_ckpt),
+        tts_conf=str(tts_conf),
+        speakers_path=str(speakers_path),
+        speaker=speaker,
+    )
+    return infer
+
+
+@app.on_event("startup")
+def on_startup() -> None:
+    global inference
+    inference = init_inference()
+
+
+def cleanup_files(files: List[str], temp_dir: str | None = None) -> None:
+    for path in files:
+        try:
+            if path and os.path.exists(path):
+                os.remove(path)
+        except Exception:
+            pass
+
+    if temp_dir and os.path.exists(temp_dir):
+        try:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+
+@app.post("/api/generate")
+async def generate_audio(
+    background_tasks: BackgroundTasks,
     text: str = Form(...),
-    image: UploadFile = File(...),
+    images: List[UploadFile] = File(...),
 ):
-    if not text.strip():
+    """
+    Вход:
+      - text: текст для озвучивания
+      - images: 1–16 фотографий (JPG/PNG)
+
+    Выход:
+      - аудиофайл (audio/wav)
+    """
+    if inference is None:
+        raise HTTPException(status_code=500, detail="Модель не инициализирована")
+
+    text = text.strip()
+    if not text:
         raise HTTPException(status_code=400, detail="Текст обязателен")
-    if len(text) > MAX_TEXT_LEN:
-        raise HTTPException(status_code=400, detail="Текст слишком длинный")
 
-    if image.content_type not in ALLOWED_CONTENT_TYPES:
-        raise HTTPException(status_code=400, detail="Допустимы только JPG и PNG")
+    if len(images) == 0:
+        raise HTTPException(status_code=400, detail="Нужно загрузить хотя бы одно фото")
 
-    file_bytes = await image.read()
-    if len(file_bytes) > MAX_FILE_SIZE:
-        raise HTTPException(status_code=400, detail="Файл слишком большой (макс 25 МБ)")
+    if len(images) > 16:
+        raise HTTPException(status_code=400, detail="Максимум 16 фотографий")
 
-    submission_id = uuid.uuid4().hex
+    temp_dir = tempfile.mkdtemp(prefix="face2voice_")
+    image_paths: List[str] = []
 
-    if image.content_type == "image/png":
-        ext = ".png"
-    else:
-        ext = ".jpg"
+    for idx, img in enumerate(images):
+        filename = img.filename or f"image_{idx}.png"
+        ext = os.path.splitext(filename)[1].lower()
+        if ext not in [".jpg", ".jpeg", ".png"]:
+            cleanup_files(image_paths, temp_dir)
+            raise HTTPException(
+                status_code=400,
+                detail=f"Недопустимый формат файла: {filename}. Разрешены JPG/PNG.",
+            )
 
-    image_path = IMAGES_DIR / f"{submission_id}{ext}"
-    text_path = TEXTS_DIR / f"{submission_id}.txt"
+        out_path = os.path.join(temp_dir, f"image_{idx}{ext}")
+        content = await img.read()
+        with open(out_path, "wb") as f:
+            f.write(content)
+        image_paths.append(out_path)
 
-    image_path.write_bytes(file_bytes)
-    text_path.write_text(text, encoding="utf-8")
+    image_path = image_paths[0]
 
-    await image.close()
+    base_audio_path = os.path.join(temp_dir, "base_tts.wav")
+    output_audio_path = os.path.join(temp_dir, "result.wav")
 
-    return JSONResponse(
-        {
-            "status": "ok",
-            "id": submission_id,
-            "message": "Данные сохранены",
-        }
+    try:
+        inference.synthesize_voice(
+            image_path=image_path,
+            base_audio_path=base_audio_path,
+            output_path=output_audio_path,
+            text=text,
+            language="ru",
+        )
+    except Exception as e:
+        cleanup_files(image_paths + [base_audio_path, output_audio_path], temp_dir)
+        raise HTTPException(status_code=500, detail=f"Ошибка генерации аудио: {e}")
+
+    if not os.path.exists(output_audio_path):
+        cleanup_files(image_paths + [base_audio_path, output_audio_path], temp_dir)
+        raise HTTPException(status_code=500, detail="Аудиофайл не был создан")
+
+    files_to_remove = image_paths + [base_audio_path, output_audio_path]
+    background_tasks.add_task(cleanup_files, files_to_remove, temp_dir)
+
+    return FileResponse(
+        path=output_audio_path,
+        media_type="audio/wav",
+        filename="face2voice.wav",
     )
