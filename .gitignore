@@ -18,3 +18,14 @@ Thumbs.db
 
 # ---- Logs ----
 *.log
+
+
+# локальное окружение и выходы
+venv/
+outputs/
+
+# модели и чекпоинты (чтобы не тащить гигабайты на GitHub)
+face2voice/checkpoints/
+*.pth
+*.pt
+
